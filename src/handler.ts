@@ -14,10 +14,6 @@ import {
   ListRecommendationsCommand
 } from '@aws-sdk/client-cost-optimization-hub'
 
-//import type { APIGatewayProxyEventV2 } from 'aws-lambda'
-
-
-
 /**
  * -----------------------
  * Types
@@ -25,29 +21,6 @@ import {
  */
 
 type CostGroup = Group
-
-// type CostFilter = {
-//   key: Dimension
-//   value: string
-// }
-
-// type DrilldownItem = {
-//   key: string
-//   cost: number
-//   percentageOfParent?: number
-// }
-
-// type DrilldownRequest = {
-//   filters?: CostFilter[]
-//   groupBy: Dimension
-// }
-
-// type DrilldownResponse = {
-//   groupBy: Dimension
-//   nextGroupBy?: Dimension
-//   filters: CostFilter[]
-//   items: DrilldownItem[]
-// }
 
 type TopRecommendation = {
   resourceType: string
@@ -135,25 +108,6 @@ const coh = new CostOptimizationHubClient({ region: 'us-east-1' })
 
 /**
  * -----------------------
- * Drilldown hierarchy
- * -----------------------
- */
-// const DRILLDOWN_LEVELS: Dimension[] = [
-//   'SERVICE',
-//   'USAGE_TYPE',
-//   'REGION',
-//   'OPERATION',
-//   'LINKED_ACCOUNT',
-//   'RESOURCE_ID'
-// ]
-
-// function getNextGroupBy(current: Dimension): Dimension | undefined {
-//   const idx = DRILLDOWN_LEVELS.indexOf(current)
-//   return DRILLDOWN_LEVELS[idx + 1]
-// }
-
-/**
- * -----------------------
  * Date helpers
  * -----------------------
  */
@@ -202,22 +156,6 @@ function getPreviousMonthRange() {
     end: toYMD(end)
   }
 }
-
-// function buildFilter(filters: CostFilter[]): Expression | undefined {
-//   if (!filters.length) return undefined
-
-//   const expressions: Expression[] = filters.map(f => ({
-//     Dimensions: {
-//       Key: f.key,
-//       Values: [f.value]
-//     }
-//   }))
-
-//   if (expressions.length === 1) return expressions[0]
-
-//   // FIX: prevent AWS AND error
-//   return expressions.length > 1 ? { And: expressions } : expressions[0]
-// }
 
 function buildTopCostIncreaseDrivers(
   current: { service: string; cost: number }[],
@@ -794,99 +732,6 @@ async function handleSummary(month?: string): Promise<SummaryResponse> {
   }
 }
 
-// /**
-//  * -----------------------
-//  * DRILLDOWN HANDLER
-//  * -----------------------
-//  */
-// async function handleDrilldown(
-//   body: DrilldownRequest
-// ): Promise<DrilldownResponse & {
-//   total: number
-//   context: {
-//     depth: number
-//     path: CostFilter[]
-//     groupBy: Dimension
-//     nextGroupBy?: Dimension
-//   }
-// }> {
-//   const filters = body.filters ?? []
-//   const groupBy = body.groupBy
-
-//   const start = getStartOfMonth()
-//   const end = toYMD(new Date())
-
-//   const res = await ce.send(
-//     new GetCostAndUsageCommand({
-//       TimePeriod: { Start: start, End: end },
-//       Granularity: 'MONTHLY',
-//       Metrics: ['UnblendedCost'],
-//       GroupBy: [{ Type: 'DIMENSION', Key: groupBy }],
-//       Filter: buildFilter(filters)
-//     })
-//   )
-
-//   const rawItems =
-//     res.ResultsByTime?.[0]?.Groups ?? []
-
-//   // ----------------------------
-//   // BASE TRANSFORM
-//   // ----------------------------
-//   const items = rawItems
-//     .map(g => ({
-//       key: g.Keys?.[0] ?? 'Unknown',
-//       cost: Number(
-//         parseFloat(
-//           g.Metrics?.UnblendedCost?.Amount ?? '0'
-//         ).toFixed(2)
-//       )
-//     }))
-//     .filter(i => i.cost > 0)
-
-//   // ----------------------------
-//   // TOTAL (for % calculations)
-//   // ----------------------------
-//   const total = items.reduce((s, i) => s + i.cost, 0)
-
-//   // ----------------------------
-//   // STABLE SORT (IMPORTANT FIX)
-//   // ----------------------------
-//   const sorted = items.sort((a, b) => {
-//     if (b.cost !== a.cost) return b.cost - a.cost
-//     return a.key.localeCompare(b.key)
-//   })
-
-//   // ----------------------------
-//   // ENRICH WITH PARENT PERCENTAGE
-//   // ----------------------------
-//   const enriched = sorted.map(i => ({
-//     ...i,
-//     percentageOfParent:
-//       total === 0
-//         ? 0
-//         : Number(((i.cost / total) * 100).toFixed(2))
-//   }))
-
-//   // ----------------------------
-//   // CONTEXT (NEW)
-//   // ----------------------------
-//   const context = {
-//     depth: filters.length,
-//     path: filters,
-//     groupBy,
-//     nextGroupBy: getNextGroupBy(groupBy)
-//   }
-
-//   return {
-//     groupBy,
-//     nextGroupBy: context.nextGroupBy,
-//     filters,
-//     items: enriched,
-//     total,
-//     context
-//   }
-// }
-
 /**
  * -----------------------
  * MAIN HANDLER
@@ -902,52 +747,3 @@ export const handler = async () => {
     body: JSON.stringify(summary)
   }
 }
-
-// export const handler = async (
-//   event: APIGatewayProxyEventV2
-// ): Promise<{ statusCode: number; body: string }> => {
-//   try {
-//     const method = event.requestContext.http.method
-
-//     if (method === 'GET') {
-//       const month = event.queryStringParameters?.month
-//       const summary = await handleSummary(month)
-
-//       return {
-//         statusCode: 200,
-//         body: JSON.stringify(summary)
-//       }
-//     }
-
-//     if (method === 'POST') {
-//       const body: DrilldownRequest = JSON.parse(event.body ?? '{}')
-
-//       if (!body.groupBy) {
-//         return {
-//           statusCode: 400,
-//           body: JSON.stringify({ error: 'groupBy is required' })
-//         }
-//       }
-
-//       const result = await handleDrilldown(body)
-
-//       return {
-//         statusCode: 200,
-//         body: JSON.stringify(result)
-//       }
-//     }
-
-//     return {
-//       statusCode: 405,
-//       body: JSON.stringify({ error: 'Method not allowed' })
-//     }
-//   } catch (err) {
-//     console.error(err)
-//     console.error('DRILLDOWN ERROR RAW:', err)
-
-//     return {
-//       statusCode: 500,
-//       body: JSON.stringify({ error: 'Internal server error' })
-//     }
-//   }
-// }

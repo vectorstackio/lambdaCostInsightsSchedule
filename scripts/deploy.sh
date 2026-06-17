@@ -1,6 +1,6 @@
 #!/bin/bash
 
-FUNCTION_NAME="costInsights"
+FUNCTION_NAME="costinsightsschedule"
 
 aws lambda update-function-code \
   --function-name $FUNCTION_NAME \
