@@ -1,6 +1,8 @@
 // handler.ts
 
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
+import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
 import { handleSummary } from './lib/summary'
 import { generatePdf } from './lib/pdf'
@@ -47,6 +49,36 @@ export const handler = async () => {
   )
 
   console.log('PDF and JSON uploaded to S3:', key)
+
+  const ses = new SESClient({})
+
+  const command = new GetObjectCommand({
+    Bucket: 'tbccostreports',
+    Key: `reports/${month}-scheduled.pdf`
+  })
+
+  const url = await getSignedUrl(s3, command, { expiresIn: 60 * 60 * 24 * 7 })
+
+  await ses.send(
+    new SendEmailCommand({
+      Source: 'reports@thebrilliantclub.org',
+      Destination: {
+        ToAddresses: ['mike.garthwaite@thebrilliantclub.org', 'apoorwa.saxena@thebrilliantclub.org']
+      },
+      Message: {
+        Subject: {
+          Data: `AWS Cost Report - ${month}`
+        },
+        Body: {
+          Text: {
+            Data: `Your report is ready:\n\n${url}`
+          }
+        }
+      }
+    })
+  )
+
+  console.log('Email sent to: mike.garthwaite@thebrilliantclub.org')
 
   // 5. Return response
   return {

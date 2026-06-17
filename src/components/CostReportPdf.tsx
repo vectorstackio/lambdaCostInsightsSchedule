@@ -270,6 +270,10 @@ export const CostReportPdf = ({ report/*, month */ }: Props) => (
         </Text>
       </View>
 
+      <View style={styles.section}>
+        <Text>View more cost information <a href='https://aws.develop.thebrilliantclub.org/dashboard'>here</a>. </Text>
+      </View>
+
     </Page>
   </Document>
 )
