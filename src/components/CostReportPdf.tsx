@@ -118,7 +118,7 @@ const styles = StyleSheet.create({
 
 type Props = {
   report: CostReport
-  month: string
+  //month: string
 }
 
 

@@ -1,736 +1,738 @@
 // handler.ts
 
-import {
-  CostExplorerClient,
-  GetCostAndUsageCommand,
-  type Dimension,
-  type Expression,
-  type ResultByTime,
-  type Group,
-} from '@aws-sdk/client-cost-explorer'
-
-import {
-  CostOptimizationHubClient,
-  ListRecommendationsCommand
-} from '@aws-sdk/client-cost-optimization-hub'
-
-/**
- * -----------------------
- * Types
- * -----------------------
- */
-
-type CostGroup = Group
-
-type TopRecommendation = {
-  resourceType: string
-  action: string
-  current: string
-  recommended: string
-}
-
-type ServiceComparison = {
-  service: string
-  currentCost: number
-  previousCost: number
-  change: number
-  changePercent: number
-}
-
-type TrendPoint = {
-  month: string
-  cost: number
-}
-
-type CostIncreaseDriver = {
-  service: string
-  currentCost: number
-  previousCost: number
-  increase: number
-  contributionPercent: number
-  isNewService: boolean
-}
-
-type ServiceAnomaly = {
-  service: string
-  currentCost: number
-  averageCost: number
-  spikeAmount: number
-  spikePercent: number
-  zScore: number
-  severity: 'low' | 'medium' | 'high'
-}
-
-type RootCauseNode = {
-  level: Dimension
-  key: string
-
-  currentCost: number
-  previousCost: number
-  change: number
-  changePercent: number
-
-  contributionToParent: number
-
-  isNew?: boolean
-
-  children?: RootCauseNode[]
-}
-
-type SummaryResponse = {
-  currentMonthCost: number
-  previousMonthCost: number
-  monthOverMonthChangePercent: number
-  byService: { service: string; cost: number }[]  // 👈 revert this
-  byServiceComparison: ServiceComparison[]        // 👈 keep enhanced version separately
-  trend: TrendPoint[]
-  potentialSavings: number
-  recommendationCount: number
-  topRecommendations: TopRecommendation[]
-  topCostIncreaseDrivers: CostIncreaseDriver[]
-  anomalies: ServiceAnomaly[]
-  rootCauseTree: RootCauseNode[]
-  topCausalChains: RootCauseNode[]
-  metadata?: {
-    generatedAt: string
-    currency: string
-  }
-}
-
-/**
- * -----------------------
- * AWS Clients
- * -----------------------
- */
-
-const ce = new CostExplorerClient({ region: 'us-east-1' })
-const coh = new CostOptimizationHubClient({ region: 'us-east-1' })
-
-/**
- * -----------------------
- * Date helpers
- * -----------------------
- */
-
-function getMonthRange(month: string) {
-  const [year, monthIndex] = month.split('-').map(Number)
-
-  const start = new Date(year, monthIndex - 1, 1)
-  const end = new Date(year, monthIndex, 0) // last day of month
-
-  return {
-    start: toYMD(start),
-    end: toYMD(end)
-  }
-}
-
-function getPreviousMonthFrom(month: string) {
-  const [year, monthIndex] = month.split('-').map(Number)
-
-  const prevStart = new Date(year, monthIndex - 2, 1)
-  const prevEnd = new Date(year, monthIndex - 1, 0)
-
-  return {
-    start: toYMD(prevStart),
-    end: toYMD(prevEnd)
-  }
-}
-
-function toYMD(date: Date): string {
-  return date.toISOString().split('T')[0]
-}
-
-function getStartOfMonth(): string {
-  const now = new Date()
-  return toYMD(new Date(now.getFullYear(), now.getMonth(), 1))
-}
-
-function getPreviousMonthRange() {
-  const now = new Date()
-
-  const start = new Date(now.getFullYear(), now.getMonth() - 1, 1)
-  const end = new Date(now.getFullYear(), now.getMonth(), 0)
-
-  return {
-    start: toYMD(start),
-    end: toYMD(end)
-  }
-}
-
-function buildTopCostIncreaseDrivers(
-  current: { service: string; cost: number }[],
-  previous: { service: string; cost: number }[],
-  limit = 5
-): CostIncreaseDriver[] {
-  const previousMap = new Map(
-    previous.map(s => [s.service, s.cost])
-  )
-
-  const increases = current
-    .map(service => {
-      const previousCost =
-        previousMap.get(service.service) ?? 0
-
-      const increase = service.cost - previousCost
-
-      const isNewService = !previousMap.has(service.service)
-
-      return {
-        service: service.service,
-        currentCost: service.cost,
-        previousCost,
-        increase,
-        isNewService
-      }
-    })
-    .filter(item => item.increase > 0)
-
-  const totalIncrease = increases.reduce(
-    (sum, item) => sum + item.increase,
-    0
-  )
-
-  return increases
-    .sort((a, b) => b.increase - a.increase)
-    .slice(0, limit)
-    .map(item => ({
-      ...item,
-      contributionPercent:
-        totalIncrease === 0
-          ? 0
-          : Number(
-            (
-              (item.increase / totalIncrease) *
-              100
-            ).toFixed(2)
-          )
-    }))
-}
-
-/**
- * -----------------------
- * Core cost function (reused everywhere)
- * -----------------------
- */
-
-async function getCostData(start: string, end: string) {
-  const res = await ce.send(
-    new GetCostAndUsageCommand({
-      TimePeriod: { Start: start, End: end },
-      Granularity: 'MONTHLY',
-      Metrics: ['UnblendedCost'],
-      GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }]
-    })
-  )
-
-  const byService =
-    res.ResultsByTime?.[0]?.Groups?.map((g) => ({
-      service: g.Keys?.[0] ?? 'Unknown',
-      cost: Number(parseFloat(g.Metrics?.UnblendedCost?.Amount ?? '0').toFixed(2))
-    })) ?? []
-
-  const total = byService.reduce((sum, s) => sum + s.cost, 0)
-
-  return {
-    total: Number(total.toFixed(2)),
-    byService
-  }
-}
-
-/**
- * -----------------------
- * MoM + comparison helpers
- * -----------------------
- */
-
-function calculateMoMChange(current: number, previous: number) {
-  if (previous === 0) return 0
-  return Number((((current - previous) / previous) * 100).toFixed(2))
-}
-
-function buildServiceComparison(
-  current: { service: string; cost: number }[],
-  previous: { service: string; cost: number }[]
-): ServiceComparison[] {
-  const prevMap = new Map(previous.map(s => [s.service, s.cost]))
-
-  const allServices = new Set([
-    ...current.map(s => s.service),
-    ...previous.map(s => s.service)
-  ])
-
-  return Array.from(allServices).map(service => {
-    const currentCost = current.find(s => s.service === service)?.cost ?? 0
-    const previousCost = prevMap.get(service) ?? 0
-
-    const change = Number((currentCost - previousCost).toFixed(2))
-    const changePercent =
-      previousCost === 0 ? 0 : Number(((change / previousCost) * 100).toFixed(2))
-
-    return {
-      service,
-      currentCost,
-      previousCost,
-      change,
-      changePercent
-    }
-  }).sort((a, b) => b.currentCost - a.currentCost)
-}
-
-/**
- * -----------------------
- * 6-month trend
- * -----------------------
- */
-
-function getLast6Months() {
-  const now = new Date()
-
-  return Array.from({ length: 6 }).map((_, i) => {
-    const start = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1)
-    const end = new Date(now.getFullYear(), now.getMonth() - (5 - i) + 1, 0)
-
-    return {
-      start: toYMD(start),
-      end: toYMD(end),
-      month: start.toISOString().slice(0, 7)
-    }
-  })
-}
-
-async function getTrend(): Promise<TrendPoint[]> {
-  const months = getLast6Months()
-
-  const results = await Promise.all(
-    months.map(async (m) => {
-      const res = await ce.send(
-        new GetCostAndUsageCommand({
-          TimePeriod: { Start: m.start, End: m.end },
-          Granularity: 'MONTHLY',
-          Metrics: ['UnblendedCost']
-        })
-      )
-
-      const cost =
-        res.ResultsByTime?.[0]?.Total?.UnblendedCost?.Amount ?? '0'
-
-      return {
-        month: m.month,
-        cost: Number(parseFloat(cost).toFixed(2))
-      }
-    })
-  )
-
-  return results
-}
-
-async function getServiceHistory(months = 6) {
-  const now = new Date()
-
-  const start = new Date(
-    now.getFullYear(),
-    now.getMonth() - (months - 1),
-    1
-  )
-
-  const end = new Date(
-    now.getFullYear(),
-    now.getMonth() + 1,
-    1
-  )
-
-  const res = await ce.send(
-    new GetCostAndUsageCommand({
-      TimePeriod: {
-        Start: toYMD(start),
-        End: toYMD(end)
-      },
-      Granularity: 'MONTHLY',
-      Metrics: ['UnblendedCost'],
-      GroupBy: [
-        {
-          Type: 'DIMENSION',
-          Key: 'SERVICE'
-        }
-      ]
-    })
-  )
-
-  return res.ResultsByTime ?? []
-}
-
-function average(values: number[]) {
-  return (
-    values.reduce((a, b) => a + b, 0) /
-    values.length
-  )
-}
-
-function stdDev(values: number[]) {
-  const avg = average(values)
-
-  const variance =
-    values.reduce(
-      (sum, v) => sum + Math.pow(v - avg, 2),
-      0
-    ) / values.length
-
-  return Math.sqrt(variance)
-}
-
-function buildServiceHistoryMap(
-  resultsByTime: ResultByTime[]
-): Record<string, number[]> {
-  const history: Record<string, number[]> = {}
-
-  for (const month of resultsByTime) {
-    for (const group of month.Groups ?? []) {
-      const service = group.Keys?.[0] ?? 'Unknown'
-
-      const cost = Number(
-        group.Metrics?.UnblendedCost?.Amount ?? '0'
-      )
-
-      if (!history[service]) {
-        history[service] = []
-      }
-
-      history[service].push(cost)
-    }
-  }
-
-  return history
-}
-
-function buildAnomalies(
-  serviceHistory: Record<string, number[]>
-): ServiceAnomaly[] {
-  const anomalies: ServiceAnomaly[] = []
-
-  for (const [service, history] of Object.entries(
-    serviceHistory
-  )) {
-    if (history.length < 4) continue
-
-    const current = history[history.length - 1]
-
-    const baseline = history.slice(0, -1)
-
-    const avg = average(baseline)
-    const sd = stdDev(baseline)
-
-    if (sd === 0) continue
-
-    const zScore = (current - avg) / sd
-
-    if (zScore < 2) continue
-
-    const spikeAmount = current - avg
-
-    anomalies.push({
-      service,
-      currentCost: Number(current.toFixed(2)),
-      averageCost: Number(avg.toFixed(2)),
-      spikeAmount: Number(spikeAmount.toFixed(2)),
-      spikePercent: Number(
-        (((current - avg) / avg) * 100).toFixed(2)
-      ),
-      zScore: Number(zScore.toFixed(2)),
-      severity:
-        zScore > 4
-          ? 'high'
-          : zScore > 3
-            ? 'medium'
-            : 'low'
-    })
-  }
-
-  return anomalies.sort(
-    (a, b) => b.zScore - a.zScore
-  )
-}
-
-async function getCostBreakdown(
-  start: string,
-  end: string,
-  groupBy: Dimension[],
-  filter?: Expression
-) {
-  const res = await ce.send(
-    new GetCostAndUsageCommand({
-      TimePeriod: { Start: start, End: end },
-      Granularity: 'MONTHLY',
-      Metrics: ['UnblendedCost'],
-      GroupBy: groupBy.map(g => ({ Type: 'DIMENSION', Key: g })),
-      Filter: filter
-    })
-  )
-
-  return res.ResultsByTime?.[0]?.Groups ?? []
-}
-
-function buildHierarchy(
-  groups: CostGroup[],
-  levels: Dimension[]
-): RootCauseNode[] {
-  const level = levels[0]
-  const nextLevels = levels.slice(1)
-
-  const map = new Map<
-    string,
-    {
-      key: string
-      level: Dimension
-      currentCost: number
-      previousCost: number
-      childrenRaw: CostGroup[]
-    }
-  >()
-
-  for (const g of groups) {
-    const key = g.Keys?.[0] ?? 'Unknown'
-
-    const cost = Number(
-      g.Metrics?.UnblendedCost?.Amount ?? 0
-    )
-
-    const existing = map.get(key)
-
-    if (!existing) {
-      map.set(key, {
-        key,
-        level,
-        currentCost: cost,
-        previousCost: 0,
-        childrenRaw: [g]
-      })
-    } else {
-      existing.currentCost += cost
-      existing.childrenRaw.push(g)
-    }
-  }
-
-  const nodes: RootCauseNode[] = []
-
-  for (const node of map.values()) {
-    const children =
-      nextLevels.length > 0
-        ? buildHierarchy(node.childrenRaw, nextLevels)
-        : undefined
-
-    const change = node.currentCost - node.previousCost
-
-    nodes.push({
-      level: node.level,
-      key: node.key,
-      currentCost: node.currentCost,
-      previousCost: node.previousCost,
-      change,
-      changePercent:
-        node.previousCost === 0
-          ? 0
-          : Number(
-            ((change / node.previousCost) * 100).toFixed(2)
-          ),
-      contributionToParent: 0,
-      children
-    })
-  }
-
-  return nodes.sort(
-    (a, b) => b.currentCost - a.currentCost
-  )
-}
-
-function enrichWithPrevious(
-  current: RootCauseNode[],
-  previousMap: Map<string, number>
-): RootCauseNode[] {
-
-  return current.map(node => {
-    const prev = previousMap.get(node.key) ?? 0
-
-    const change = node.currentCost - prev
-
-    const changePercent =
-      prev === 0 ? 100 : (change / prev) * 100
-
-    const children = node.children
-      ? enrichWithPrevious(node.children, previousMap)
-      : undefined
-
-    return {
-      ...node,
-      previousCost: prev,
-      change,
-      changePercent,
-      isNew: prev === 0,
-      children
-    }
-  })
-}
-
-function extractTopCausalChain(nodes: RootCauseNode[]): RootCauseNode[] {
-  return nodes
-    .sort((a, b) => b.change - a.change)
-    .slice(0, 3)
-}
-
-/**
- * -----------------------
- * SUMMARY HANDLER
- * -----------------------
- */
-async function handleSummary(month?: string): Promise<SummaryResponse> {
-  const now = new Date()
-
-  const currentRange = month
-    ? getMonthRange(month)
-    : {
-      start: getStartOfMonth(),
-      end: toYMD(now)
-    }
-
-  const prevRange = month
-    ? getPreviousMonthFrom(month)
-    : getPreviousMonthRange()
-
-  // const current = getStartOfMonth()
-  // const end = toYMD(new Date())
-  // const prev = getPreviousMonthRange()
-
-  const [
-    currentData,
-    previousData,
-    recRes,
-    trend,
-    serviceHistory
-  ] = await Promise.all([
-    // getCostData(current, end),
-    // getCostData(prev.start, prev.end),
-    getCostData(currentRange.start, currentRange.end),
-    getCostData(prevRange.start, prevRange.end),
-    coh.send(new ListRecommendationsCommand({ maxResults: 100 })),
-    getTrend(),
-    getServiceHistory()
-  ])
-
-  const monthOverMonthChangePercent =
-    calculateMoMChange(
-      currentData.total,
-      previousData.total
-    )
-
-  const byService = buildServiceComparison(
-    currentData.byService,
-    previousData.byService
-  )
-
-  const topCostIncreaseDrivers =
-    buildTopCostIncreaseDrivers(
-      currentData.byService,
-      previousData.byService
-    )
-
-  let potentialSavings = 0
-
-  const topRecommendations: TopRecommendation[] =
-    (recRes.items ?? []).map(r => {
-      potentialSavings +=
-        r.estimatedMonthlySavings ?? 0
-
-      return {
-        resourceType:
-          r.currentResourceType ?? 'Unknown',
-        action: r.actionType ?? 'Unknown',
-        current:
-          r.currentResourceSummary ?? 'N/A',
-        recommended:
-          r.recommendedResourceSummary ?? 'N/A'
-      }
-    })
-
-  const serviceHistoryMap = buildServiceHistoryMap(serviceHistory)
-
-  const anomalies = buildAnomalies(serviceHistoryMap)
-
-  const currentRaw = await getCostBreakdown(
-    currentRange.start,
-    currentRange.end,
-    ['SERVICE']
-  )
-
-  const previousRaw = await getCostBreakdown(
-    prevRange.start,
-    prevRange.end,
-    ['SERVICE']
-  )
-
-  // const currentRaw = await getCostBreakdown(
-  //   current,
-  //   end,
-  //   ['SERVICE']
-  // )
-
-  // const previousRaw = await getCostBreakdown(
-  //   prev.start,
-  //   prev.end,
-  //   ['SERVICE']
-  // )
-
-  const tree = buildHierarchy(
-    currentRaw,
-    ['SERVICE', 'REGION', 'USAGE_TYPE']
-  )
-
-  const topCausalChains = extractTopCausalChain(tree)
-
-  const previousMap = new Map(
-    previousRaw.map(g => [
-      g.Keys?.[0] ?? 'Unknown',
-      Number(g.Metrics?.UnblendedCost?.Amount ?? 0)
-    ])
-  )
-
-  const rootCauseTree = enrichWithPrevious(tree, previousMap)
-
-  return {
-    currentMonthCost: currentData.total,
-    previousMonthCost: previousData.total,
-
-    byService: currentData.byService.map(s => ({
-      service: s.service,
-      cost: s.cost
-    })),
-
-    byServiceComparison: byService,
-
-    topCostIncreaseDrivers,
-
-    monthOverMonthChangePercent,
-
-    trend,
-
-    anomalies,
-
-    potentialSavings: Number(
-      potentialSavings.toFixed(2)
-    ),
-
-    recommendationCount: recRes.items?.length ?? 0,
-
-    topRecommendations: topRecommendations,
-
-    rootCauseTree,
-
-    topCausalChains,
-
-    metadata: {
-      generatedAt: new Date().toISOString(),
-      currency: 'USD'
-    }
-  }
-}
+// import {
+//   CostExplorerClient,
+//   GetCostAndUsageCommand,
+//   type Dimension,
+//   type Expression,
+//   type ResultByTime,
+//   type Group,
+// } from '@aws-sdk/client-cost-explorer'
+
+// import {
+//   CostOptimizationHubClient,
+//   ListRecommendationsCommand
+// } from '@aws-sdk/client-cost-optimization-hub'
+
+// /**
+//  * -----------------------
+//  * Types
+//  * -----------------------
+//  */
+
+// type CostGroup = Group
+
+// type TopRecommendation = {
+//   resourceType: string
+//   action: string
+//   current: string
+//   recommended: string
+// }
+
+// type ServiceComparison = {
+//   service: string
+//   currentCost: number
+//   previousCost: number
+//   change: number
+//   changePercent: number
+// }
+
+// type TrendPoint = {
+//   month: string
+//   cost: number
+// }
+
+// type CostIncreaseDriver = {
+//   service: string
+//   currentCost: number
+//   previousCost: number
+//   increase: number
+//   contributionPercent: number
+//   isNewService: boolean
+// }
+
+// type ServiceAnomaly = {
+//   service: string
+//   currentCost: number
+//   averageCost: number
+//   spikeAmount: number
+//   spikePercent: number
+//   zScore: number
+//   severity: 'low' | 'medium' | 'high'
+// }
+
+// type RootCauseNode = {
+//   level: Dimension
+//   key: string
+
+//   currentCost: number
+//   previousCost: number
+//   change: number
+//   changePercent: number
+
+//   contributionToParent: number
+
+//   isNew?: boolean
+
+//   children?: RootCauseNode[]
+// }
+
+// type SummaryResponse = {
+//   currentMonthCost: number
+//   previousMonthCost: number
+//   monthOverMonthChangePercent: number
+//   byService: { service: string; cost: number }[]  // 👈 revert this
+//   byServiceComparison: ServiceComparison[]        // 👈 keep enhanced version separately
+//   trend: TrendPoint[]
+//   potentialSavings: number
+//   recommendationCount: number
+//   topRecommendations: TopRecommendation[]
+//   topCostIncreaseDrivers: CostIncreaseDriver[]
+//   anomalies: ServiceAnomaly[]
+//   rootCauseTree: RootCauseNode[]
+//   topCausalChains: RootCauseNode[]
+//   metadata?: {
+//     generatedAt: string
+//     currency: string
+//   }
+// }
+
+// /**
+//  * -----------------------
+//  * AWS Clients
+//  * -----------------------
+//  */
+
+// const ce = new CostExplorerClient({ region: 'us-east-1' })
+// const coh = new CostOptimizationHubClient({ region: 'us-east-1' })
+
+// /**
+//  * -----------------------
+//  * Date helpers
+//  * -----------------------
+//  */
+
+// function getMonthRange(month: string) {
+//   const [year, monthIndex] = month.split('-').map(Number)
+
+//   const start = new Date(year, monthIndex - 1, 1)
+//   const end = new Date(year, monthIndex, 0) // last day of month
+
+//   return {
+//     start: toYMD(start),
+//     end: toYMD(end)
+//   }
+// }
+
+// function getPreviousMonthFrom(month: string) {
+//   const [year, monthIndex] = month.split('-').map(Number)
+
+//   const prevStart = new Date(year, monthIndex - 2, 1)
+//   const prevEnd = new Date(year, monthIndex - 1, 0)
+
+//   return {
+//     start: toYMD(prevStart),
+//     end: toYMD(prevEnd)
+//   }
+// }
+
+// function toYMD(date: Date): string {
+//   return date.toISOString().split('T')[0]
+// }
+
+// function getStartOfMonth(): string {
+//   const now = new Date()
+//   return toYMD(new Date(now.getFullYear(), now.getMonth(), 1))
+// }
+
+// function getPreviousMonthRange() {
+//   const now = new Date()
+
+//   const start = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+//   const end = new Date(now.getFullYear(), now.getMonth(), 0)
+
+//   return {
+//     start: toYMD(start),
+//     end: toYMD(end)
+//   }
+// }
+
+// function buildTopCostIncreaseDrivers(
+//   current: { service: string; cost: number }[],
+//   previous: { service: string; cost: number }[],
+//   limit = 5
+// ): CostIncreaseDriver[] {
+//   const previousMap = new Map(
+//     previous.map(s => [s.service, s.cost])
+//   )
+
+//   const increases = current
+//     .map(service => {
+//       const previousCost =
+//         previousMap.get(service.service) ?? 0
+
+//       const increase = service.cost - previousCost
+
+//       const isNewService = !previousMap.has(service.service)
+
+//       return {
+//         service: service.service,
+//         currentCost: service.cost,
+//         previousCost,
+//         increase,
+//         isNewService
+//       }
+//     })
+//     .filter(item => item.increase > 0)
+
+//   const totalIncrease = increases.reduce(
+//     (sum, item) => sum + item.increase,
+//     0
+//   )
+
+//   return increases
+//     .sort((a, b) => b.increase - a.increase)
+//     .slice(0, limit)
+//     .map(item => ({
+//       ...item,
+//       contributionPercent:
+//         totalIncrease === 0
+//           ? 0
+//           : Number(
+//             (
+//               (item.increase / totalIncrease) *
+//               100
+//             ).toFixed(2)
+//           )
+//     }))
+// }
+
+// /**
+//  * -----------------------
+//  * Core cost function (reused everywhere)
+//  * -----------------------
+//  */
+
+// async function getCostData(start: string, end: string) {
+//   const res = await ce.send(
+//     new GetCostAndUsageCommand({
+//       TimePeriod: { Start: start, End: end },
+//       Granularity: 'MONTHLY',
+//       Metrics: ['UnblendedCost'],
+//       GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }]
+//     })
+//   )
+
+//   const byService =
+//     res.ResultsByTime?.[0]?.Groups?.map((g) => ({
+//       service: g.Keys?.[0] ?? 'Unknown',
+//       cost: Number(parseFloat(g.Metrics?.UnblendedCost?.Amount ?? '0').toFixed(2))
+//     })) ?? []
+
+//   const total = byService.reduce((sum, s) => sum + s.cost, 0)
+
+//   return {
+//     total: Number(total.toFixed(2)),
+//     byService
+//   }
+// }
+
+// /**
+//  * -----------------------
+//  * MoM + comparison helpers
+//  * -----------------------
+//  */
+
+// function calculateMoMChange(current: number, previous: number) {
+//   if (previous === 0) return 0
+//   return Number((((current - previous) / previous) * 100).toFixed(2))
+// }
+
+// function buildServiceComparison(
+//   current: { service: string; cost: number }[],
+//   previous: { service: string; cost: number }[]
+// ): ServiceComparison[] {
+//   const prevMap = new Map(previous.map(s => [s.service, s.cost]))
+
+//   const allServices = new Set([
+//     ...current.map(s => s.service),
+//     ...previous.map(s => s.service)
+//   ])
+
+//   return Array.from(allServices).map(service => {
+//     const currentCost = current.find(s => s.service === service)?.cost ?? 0
+//     const previousCost = prevMap.get(service) ?? 0
+
+//     const change = Number((currentCost - previousCost).toFixed(2))
+//     const changePercent =
+//       previousCost === 0 ? 0 : Number(((change / previousCost) * 100).toFixed(2))
+
+//     return {
+//       service,
+//       currentCost,
+//       previousCost,
+//       change,
+//       changePercent
+//     }
+//   }).sort((a, b) => b.currentCost - a.currentCost)
+// }
+
+// /**
+//  * -----------------------
+//  * 6-month trend
+//  * -----------------------
+//  */
+
+// function getLast6Months() {
+//   const now = new Date()
+
+//   return Array.from({ length: 6 }).map((_, i) => {
+//     const start = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1)
+//     const end = new Date(now.getFullYear(), now.getMonth() - (5 - i) + 1, 0)
+
+//     return {
+//       start: toYMD(start),
+//       end: toYMD(end),
+//       month: start.toISOString().slice(0, 7)
+//     }
+//   })
+// }
+
+// async function getTrend(): Promise<TrendPoint[]> {
+//   const months = getLast6Months()
+
+//   const results = await Promise.all(
+//     months.map(async (m) => {
+//       const res = await ce.send(
+//         new GetCostAndUsageCommand({
+//           TimePeriod: { Start: m.start, End: m.end },
+//           Granularity: 'MONTHLY',
+//           Metrics: ['UnblendedCost']
+//         })
+//       )
+
+//       const cost =
+//         res.ResultsByTime?.[0]?.Total?.UnblendedCost?.Amount ?? '0'
+
+//       return {
+//         month: m.month,
+//         cost: Number(parseFloat(cost).toFixed(2))
+//       }
+//     })
+//   )
+
+//   return results
+// }
+
+// async function getServiceHistory(months = 6) {
+//   const now = new Date()
+
+//   const start = new Date(
+//     now.getFullYear(),
+//     now.getMonth() - (months - 1),
+//     1
+//   )
+
+//   const end = new Date(
+//     now.getFullYear(),
+//     now.getMonth() + 1,
+//     1
+//   )
+
+//   const res = await ce.send(
+//     new GetCostAndUsageCommand({
+//       TimePeriod: {
+//         Start: toYMD(start),
+//         End: toYMD(end)
+//       },
+//       Granularity: 'MONTHLY',
+//       Metrics: ['UnblendedCost'],
+//       GroupBy: [
+//         {
+//           Type: 'DIMENSION',
+//           Key: 'SERVICE'
+//         }
+//       ]
+//     })
+//   )
+
+//   return res.ResultsByTime ?? []
+// }
+
+// function average(values: number[]) {
+//   return (
+//     values.reduce((a, b) => a + b, 0) /
+//     values.length
+//   )
+// }
+
+// function stdDev(values: number[]) {
+//   const avg = average(values)
+
+//   const variance =
+//     values.reduce(
+//       (sum, v) => sum + Math.pow(v - avg, 2),
+//       0
+//     ) / values.length
+
+//   return Math.sqrt(variance)
+// }
+
+// function buildServiceHistoryMap(
+//   resultsByTime: ResultByTime[]
+// ): Record<string, number[]> {
+//   const history: Record<string, number[]> = {}
+
+//   for (const month of resultsByTime) {
+//     for (const group of month.Groups ?? []) {
+//       const service = group.Keys?.[0] ?? 'Unknown'
+
+//       const cost = Number(
+//         group.Metrics?.UnblendedCost?.Amount ?? '0'
+//       )
+
+//       if (!history[service]) {
+//         history[service] = []
+//       }
+
+//       history[service].push(cost)
+//     }
+//   }
+
+//   return history
+// }
+
+// function buildAnomalies(
+//   serviceHistory: Record<string, number[]>
+// ): ServiceAnomaly[] {
+//   const anomalies: ServiceAnomaly[] = []
+
+//   for (const [service, history] of Object.entries(
+//     serviceHistory
+//   )) {
+//     if (history.length < 4) continue
+
+//     const current = history[history.length - 1]
+
+//     const baseline = history.slice(0, -1)
+
+//     const avg = average(baseline)
+//     const sd = stdDev(baseline)
+
+//     if (sd === 0) continue
+
+//     const zScore = (current - avg) / sd
+
+//     if (zScore < 2) continue
+
+//     const spikeAmount = current - avg
+
+//     anomalies.push({
+//       service,
+//       currentCost: Number(current.toFixed(2)),
+//       averageCost: Number(avg.toFixed(2)),
+//       spikeAmount: Number(spikeAmount.toFixed(2)),
+//       spikePercent: Number(
+//         (((current - avg) / avg) * 100).toFixed(2)
+//       ),
+//       zScore: Number(zScore.toFixed(2)),
+//       severity:
+//         zScore > 4
+//           ? 'high'
+//           : zScore > 3
+//             ? 'medium'
+//             : 'low'
+//     })
+//   }
+
+//   return anomalies.sort(
+//     (a, b) => b.zScore - a.zScore
+//   )
+// }
+
+// async function getCostBreakdown(
+//   start: string,
+//   end: string,
+//   groupBy: Dimension[],
+//   filter?: Expression
+// ) {
+//   const res = await ce.send(
+//     new GetCostAndUsageCommand({
+//       TimePeriod: { Start: start, End: end },
+//       Granularity: 'MONTHLY',
+//       Metrics: ['UnblendedCost'],
+//       GroupBy: groupBy.map(g => ({ Type: 'DIMENSION', Key: g })),
+//       Filter: filter
+//     })
+//   )
+
+//   return res.ResultsByTime?.[0]?.Groups ?? []
+// }
+
+// function buildHierarchy(
+//   groups: CostGroup[],
+//   levels: Dimension[]
+// ): RootCauseNode[] {
+//   const level = levels[0]
+//   const nextLevels = levels.slice(1)
+
+//   const map = new Map<
+//     string,
+//     {
+//       key: string
+//       level: Dimension
+//       currentCost: number
+//       previousCost: number
+//       childrenRaw: CostGroup[]
+//     }
+//   >()
+
+//   for (const g of groups) {
+//     const key = g.Keys?.[0] ?? 'Unknown'
+
+//     const cost = Number(
+//       g.Metrics?.UnblendedCost?.Amount ?? 0
+//     )
+
+//     const existing = map.get(key)
+
+//     if (!existing) {
+//       map.set(key, {
+//         key,
+//         level,
+//         currentCost: cost,
+//         previousCost: 0,
+//         childrenRaw: [g]
+//       })
+//     } else {
+//       existing.currentCost += cost
+//       existing.childrenRaw.push(g)
+//     }
+//   }
+
+//   const nodes: RootCauseNode[] = []
+
+//   for (const node of map.values()) {
+//     const children =
+//       nextLevels.length > 0
+//         ? buildHierarchy(node.childrenRaw, nextLevels)
+//         : undefined
+
+//     const change = node.currentCost - node.previousCost
+
+//     nodes.push({
+//       level: node.level,
+//       key: node.key,
+//       currentCost: node.currentCost,
+//       previousCost: node.previousCost,
+//       change,
+//       changePercent:
+//         node.previousCost === 0
+//           ? 0
+//           : Number(
+//             ((change / node.previousCost) * 100).toFixed(2)
+//           ),
+//       contributionToParent: 0,
+//       children
+//     })
+//   }
+
+//   return nodes.sort(
+//     (a, b) => b.currentCost - a.currentCost
+//   )
+// }
+
+// function enrichWithPrevious(
+//   current: RootCauseNode[],
+//   previousMap: Map<string, number>
+// ): RootCauseNode[] {
+
+//   return current.map(node => {
+//     const prev = previousMap.get(node.key) ?? 0
+
+//     const change = node.currentCost - prev
+
+//     const changePercent =
+//       prev === 0 ? 100 : (change / prev) * 100
+
+//     const children = node.children
+//       ? enrichWithPrevious(node.children, previousMap)
+//       : undefined
+
+//     return {
+//       ...node,
+//       previousCost: prev,
+//       change,
+//       changePercent,
+//       isNew: prev === 0,
+//       children
+//     }
+//   })
+// }
+
+// function extractTopCausalChain(nodes: RootCauseNode[]): RootCauseNode[] {
+//   return nodes
+//     .sort((a, b) => b.change - a.change)
+//     .slice(0, 3)
+// }
+
+// /**
+//  * -----------------------
+//  * SUMMARY HANDLER
+//  * -----------------------
+//  */
+// async function handleSummary(month?: string): Promise<SummaryResponse> {
+//   const now = new Date()
+
+//   const currentRange = month
+//     ? getMonthRange(month)
+//     : {
+//       start: getStartOfMonth(),
+//       end: toYMD(now)
+//     }
+
+//   const prevRange = month
+//     ? getPreviousMonthFrom(month)
+//     : getPreviousMonthRange()
+
+//   // const current = getStartOfMonth()
+//   // const end = toYMD(new Date())
+//   // const prev = getPreviousMonthRange()
+
+//   const [
+//     currentData,
+//     previousData,
+//     recRes,
+//     trend,
+//     serviceHistory
+//   ] = await Promise.all([
+//     // getCostData(current, end),
+//     // getCostData(prev.start, prev.end),
+//     getCostData(currentRange.start, currentRange.end),
+//     getCostData(prevRange.start, prevRange.end),
+//     coh.send(new ListRecommendationsCommand({ maxResults: 100 })),
+//     getTrend(),
+//     getServiceHistory()
+//   ])
+
+//   const monthOverMonthChangePercent =
+//     calculateMoMChange(
+//       currentData.total,
+//       previousData.total
+//     )
+
+//   const byService = buildServiceComparison(
+//     currentData.byService,
+//     previousData.byService
+//   )
+
+//   const topCostIncreaseDrivers =
+//     buildTopCostIncreaseDrivers(
+//       currentData.byService,
+//       previousData.byService
+//     )
+
+//   let potentialSavings = 0
+
+//   const topRecommendations: TopRecommendation[] =
+//     (recRes.items ?? []).map(r => {
+//       potentialSavings +=
+//         r.estimatedMonthlySavings ?? 0
+
+//       return {
+//         resourceType:
+//           r.currentResourceType ?? 'Unknown',
+//         action: r.actionType ?? 'Unknown',
+//         current:
+//           r.currentResourceSummary ?? 'N/A',
+//         recommended:
+//           r.recommendedResourceSummary ?? 'N/A'
+//       }
+//     })
+
+//   const serviceHistoryMap = buildServiceHistoryMap(serviceHistory)
+
+//   const anomalies = buildAnomalies(serviceHistoryMap)
+
+//   const currentRaw = await getCostBreakdown(
+//     currentRange.start,
+//     currentRange.end,
+//     ['SERVICE']
+//   )
+
+//   const previousRaw = await getCostBreakdown(
+//     prevRange.start,
+//     prevRange.end,
+//     ['SERVICE']
+//   )
+
+//   // const currentRaw = await getCostBreakdown(
+//   //   current,
+//   //   end,
+//   //   ['SERVICE']
+//   // )
+
+//   // const previousRaw = await getCostBreakdown(
+//   //   prev.start,
+//   //   prev.end,
+//   //   ['SERVICE']
+//   // )
+
+//   const tree = buildHierarchy(
+//     currentRaw,
+//     ['SERVICE', 'REGION', 'USAGE_TYPE']
+//   )
+
+//   const topCausalChains = extractTopCausalChain(tree)
+
+//   const previousMap = new Map(
+//     previousRaw.map(g => [
+//       g.Keys?.[0] ?? 'Unknown',
+//       Number(g.Metrics?.UnblendedCost?.Amount ?? 0)
+//     ])
+//   )
+
+//   const rootCauseTree = enrichWithPrevious(tree, previousMap)
+
+//   return {
+//     currentMonthCost: currentData.total,
+//     previousMonthCost: previousData.total,
+
+//     byService: currentData.byService.map(s => ({
+//       service: s.service,
+//       cost: s.cost
+//     })),
+
+//     byServiceComparison: byService,
+
+//     topCostIncreaseDrivers,
+
+//     monthOverMonthChangePercent,
+
+//     trend,
+
+//     anomalies,
+
+//     potentialSavings: Number(
+//       potentialSavings.toFixed(2)
+//     ),
+
+//     recommendationCount: recRes.items?.length ?? 0,
+
+//     topRecommendations: topRecommendations,
+
+//     rootCauseTree,
+
+//     topCausalChains,
+
+//     metadata: {
+//       generatedAt: new Date().toISOString(),
+//       currency: 'USD'
+//     }
+//   }
+// }
+
+import { handleSummary } from './lib/summary'
 
 /**
  * -----------------------
