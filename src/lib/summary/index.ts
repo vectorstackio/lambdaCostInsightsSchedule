@@ -6,96 +6,12 @@ import {
   type Dimension,
   type Expression,
   type ResultByTime,
-  //type Group,
 } from '@aws-sdk/client-cost-explorer'
 
 import {
   CostOptimizationHubClient,
   ListRecommendationsCommand
 } from '@aws-sdk/client-cost-optimization-hub'
-
-/**
- * -----------------------
- * Types
- * -----------------------
- */
-
-// type CostGroup = Group
-
-// type TopRecommendation = {
-//   resourceType: string
-//   action: string
-//   current: string
-//   recommended: string
-// }
-
-// type ServiceComparison = {
-//   service: string
-//   currentCost: number
-//   previousCost: number
-//   change: number
-//   changePercent: number
-// }
-
-// type TrendPoint = {
-//   month: string
-//   cost: number
-// }
-
-// type CostIncreaseDriver = {
-//   service: string
-//   currentCost: number
-//   previousCost: number
-//   increase: number
-//   contributionPercent: number
-//   isNewService: boolean
-// }
-
-// type ServiceAnomaly = {
-//   service: string
-//   currentCost: number
-//   averageCost: number
-//   spikeAmount: number
-//   spikePercent: number
-//   zScore: number
-//   severity: 'low' | 'medium' | 'high'
-// }
-
-// type RootCauseNode = {
-//   level: Dimension
-//   key: string
-
-//   currentCost: number
-//   previousCost: number
-//   change: number
-//   changePercent: number
-
-//   contributionToParent: number
-
-//   isNew?: boolean
-
-//   children?: RootCauseNode[]
-// }
-
-// type SummaryResponse = {
-//   currentMonthCost: number
-//   previousMonthCost: number
-//   monthOverMonthChangePercent: number
-//   byService: { service: string; cost: number }[]  // 👈 revert this
-//   byServiceComparison: ServiceComparison[]        // 👈 keep enhanced version separately
-//   trend: TrendPoint[]
-//   potentialSavings: number
-//   recommendationCount: number
-//   topRecommendations: TopRecommendation[]
-//   topCostIncreaseDrivers: CostIncreaseDriver[]
-//   anomalies: ServiceAnomaly[]
-//   rootCauseTree: RootCauseNode[]
-//   topCausalChains: RootCauseNode[]
-//   metadata?: {
-//     generatedAt: string
-//     currency: string
-//   }
-// }
 
 import type {
   CostGroup,
@@ -606,10 +522,6 @@ export const handleSummary = async (month?: string): Promise<SummaryResponse> =>
     ? getPreviousMonthFrom(month)
     : getPreviousMonthRange()
 
-  // const current = getStartOfMonth()
-  // const end = toYMD(new Date())
-  // const prev = getPreviousMonthRange()
-
   const [
     currentData,
     previousData,
@@ -617,8 +529,6 @@ export const handleSummary = async (month?: string): Promise<SummaryResponse> =>
     trend,
     serviceHistory
   ] = await Promise.all([
-    // getCostData(current, end),
-    // getCostData(prev.start, prev.end),
     getCostData(currentRange.start, currentRange.end),
     getCostData(prevRange.start, prevRange.end),
     coh.send(new ListRecommendationsCommand({ maxResults: 100 })),
@@ -676,18 +586,6 @@ export const handleSummary = async (month?: string): Promise<SummaryResponse> =>
     prevRange.end,
     ['SERVICE']
   )
-
-  // const currentRaw = await getCostBreakdown(
-  //   current,
-  //   end,
-  //   ['SERVICE']
-  // )
-
-  // const previousRaw = await getCostBreakdown(
-  //   prev.start,
-  //   prev.end,
-  //   ['SERVICE']
-  // )
 
   const tree = buildHierarchy(
     currentRaw,
