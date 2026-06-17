@@ -71,7 +71,7 @@ export const handler = async () => {
         },
         Body: {
           Text: {
-            Data: `Your report is ready:\n\n${url}`
+            Data: `Your report is ready:\n\n${url}\n\n\nView more cost information https://aws.develop.thebrilliantclub.org/dashboard.`
           }
         }
       }

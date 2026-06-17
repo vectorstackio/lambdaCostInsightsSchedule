@@ -7,7 +7,8 @@ import {
   Text,
   View,
   StyleSheet,
-  Image
+  Image,
+  Link
 } from '@react-pdf/renderer'
 
 import type { CostReport } from "./../types";
@@ -270,8 +271,13 @@ export const CostReportPdf = ({ report/*, month */ }: Props) => (
         </Text>
       </View>
 
-      <View style={styles.section}>
-        <Text>View more cost information <a href='https://aws.develop.thebrilliantclub.org/dashboard'>here</a>. </Text>
+      <View>
+        <Text>
+          View more cost information{' '}
+          <Link src="https://aws.develop.thebrilliantclub.org/dashboard">
+            here
+          </Link>
+        </Text>
       </View>
 
     </Page>
