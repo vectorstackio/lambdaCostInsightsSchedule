@@ -37,7 +37,16 @@ export const handler = async () => {
     })
   )
 
-  console.log('PDF uploaded to S3:', key)
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: process.env.BUCKET_NAME,
+      Key: `reports/${month}-scheduled.json`,
+      Body: JSON.stringify(summary),
+      ContentType: 'application/json'
+    })
+  )
+
+  console.log('PDF and JSON uploaded to S3:', key)
 
   // 5. Return response
   return {
