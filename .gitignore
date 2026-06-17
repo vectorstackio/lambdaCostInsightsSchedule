@@ -48,3 +48,6 @@ Thumbs.db
 *.mov
 *.wmv
 
+packag-lock.json
+response.json
+.vscode/
