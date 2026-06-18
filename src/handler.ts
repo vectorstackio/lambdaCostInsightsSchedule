@@ -63,7 +63,7 @@ export const handler = async () => {
     new SendEmailCommand({
       Source: 'reports@thebrilliantclub.org',
       Destination: {
-        ToAddresses: ['mike.garthwaite@thebrilliantclub.org', 'apoorwa.saxena@thebrilliantclub.org']
+        ToAddresses: ['mike.garthwaite@thebrilliantclub.org', 'apoorwa.saxena@thebrilliantclub.org', 'sophie.callin@thebrilliantclub.org', 'leanne@thebrilliantclub.org']
       },
       Message: {
         Subject: {
