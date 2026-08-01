@@ -8,84 +8,87 @@ import { handleSummary } from './lib/summary'
 import { generatePdf } from './lib/pdf'
 import { getPreviousMonthYYYYMM } from './lib/date'
 import { toCostReport } from './lib/report'
-//import type { CostReport } from './types'
 
 const s3 = new S3Client({})
 
 export const handler = async () => {
-  // const month = '2026-06'
-  const month = getPreviousMonthYYYYMM()
+  try {
+    const month = getPreviousMonthYYYYMM()
 
-  // 1. Build report data
-  const summary = await handleSummary(month)
+    // 1. Build report data
+    const summary = await handleSummary(month)
+    const report = toCostReport(summary, month)
 
-  console.log(summary)
+    // 2. Convert summary → PDF
+    const pdfBuffer = await generatePdf(report)
 
-  const report = toCostReport(summary, month)
+    // 3. Define S3 key
+    const key = `reports/${month}-scheduled.pdf`
 
-  // 2. Convert summary → PDF
-  const pdfBuffer = await generatePdf(report)
+    // 4. Upload to S3
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: process.env.BUCKET_NAME,
+        Key: key,
+        Body: pdfBuffer,
+        ContentType: 'application/pdf'
+      })
+    )
 
-  // 3. Define S3 key
-  const key = `reports/${month}-scheduled.pdf`
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: process.env.BUCKET_NAME,
+        Key: `reports/${month}-scheduled.json`,
+        Body: JSON.stringify(summary),
+        ContentType: 'application/json'
+      })
+    )
 
-  // 4. Upload to S3
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: process.env.BUCKET_NAME,
-      Key: key,
-      Body: pdfBuffer,
-      ContentType: 'application/pdf'
+    console.log('PDF and JSON uploaded to S3:', key)
+
+    const ses = new SESClient({})
+
+    const command = new GetObjectCommand({
+      Bucket: 'tbccostreports',
+      Key: `reports/${month}-scheduled.pdf`
     })
-  )
 
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: process.env.BUCKET_NAME,
-      Key: `reports/${month}-scheduled.json`,
-      Body: JSON.stringify(summary),
-      ContentType: 'application/json'
-    })
-  )
+    const url = await getSignedUrl(s3, command, { expiresIn: 60 * 60 * 24 * 7 })
 
-  console.log('PDF and JSON uploaded to S3:', key)
-
-  const ses = new SESClient({})
-
-  const command = new GetObjectCommand({
-    Bucket: 'tbccostreports',
-    Key: `reports/${month}-scheduled.pdf`
-  })
-
-  const url = await getSignedUrl(s3, command, { expiresIn: 60 * 60 * 24 * 7 })
-
-  await ses.send(
-    new SendEmailCommand({
-      Source: 'reports@thebrilliantclub.org',
-      Destination: {
-        ToAddresses: ['mike.garthwaite@thebrilliantclub.org', 'apoorwa.saxena@thebrilliantclub.org', 'sophie.callin@thebrilliantclub.org', 'leanne@thebrilliantclub.org']
-      },
-      Message: {
-        Subject: {
-          Data: `AWS Cost Report - ${month}`
+    await ses.send(
+      new SendEmailCommand({
+        Source: 'reports@thebrilliantclub.org',
+        Destination: {
+          ToAddresses: ['mike.garthwaite@thebrilliantclub.org', 'apoorwa.saxena@thebrilliantclub.org', 'sophie.callin@thebrilliantclub.org', 'leanne@thebrilliantclub.org']
         },
-        Body: {
-          Text: {
-            Data: `Your report is ready:\n\n${url}\n\n\nView more cost information https://aws.develop.thebrilliantclub.org/dashboard.`
+        Message: {
+          Subject: {
+            Data: `AWS Cost Report - ${month}`
+          },
+          Body: {
+            Text: {
+              Data: `Your report is ready:\n\n${url}\n\n\nView more cost information https://aws.develop.thebrilliantclub.org/dashboard.`
+            }
           }
         }
-      }
-    })
-  )
+      })
+    )
 
-  console.log('Email sent to: mike.garthwaite@thebrilliantclub.org')
+    console.log('Email sent to: mike.garthwaite@thebrilliantclub.org')
 
-  // 5. Return response
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      message: 'Report generated successfully',
-      key
-    })
+    // 5. Return response
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        message: 'Report generated successfully',
+        key
+      })
+    }
+  } catch (err) {
+    console.error('Error in costInsightsScheduleLambda:', err)
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: 'Internal server error in costInsightsScheduleLambda' })
+    }
   }
 }
