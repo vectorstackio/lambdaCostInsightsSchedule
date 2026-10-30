@@ -24,11 +24,8 @@ export const handler = async () => {
           Key: key
         })
       )
-    } catch (err) {
-      console.error(
-        `Report does not exist: ${key}`,
-        err
-      )
+    } catch {
+      console.error('Report lookup failed')
       throw new Error(`Monthly report PDF missing: ${key}`)
     }
 
@@ -99,11 +96,8 @@ https://aws.develop.thebrilliantclub.org/reports
         key
       })
     }
-  } catch (err) {
-    console.error(
-      'Error in costInsightsScheduleLambda:',
-      err
-    )
+  } catch {
+    console.error('Error in costInsightsScheduleLambda')
 
     return {
       statusCode: 500,
